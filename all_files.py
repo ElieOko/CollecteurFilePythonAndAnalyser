@@ -490,7 +490,7 @@ def extraire_montants_contextualises(texte, limite=8):
     montants = []
     mots_financiers = (
         "total", "ttc", "ht", "tva", "montant", "prix", "payer", "solde",
-        "acompte", "remise", "facture", "devis", "honoraires", "loyer", "dépôt",
+        "acompte", "remise", "honoraires", "loyer", "dépôt", "somme", "frais",
     )
     for ligne in lignes:
         if not motif_montant.search(ligne):
@@ -611,7 +611,7 @@ def analyser_document(texte, fichier=None):
         "objectif": objectif,
         "titre": detecter_titre(lignes),
         "entete": liste_unique(lignes[:5], limite=3),
-        "pied": liste_unique(lignes[-5:], limite=3),
+        "pied": liste_unique([ligne for ligne in lignes[-5:] if ligne not in montants], limite=3),
         "montants": montants,
         "dates": extraire_dates(texte),
         "references": extraire_references(texte),
@@ -674,7 +674,6 @@ def phrase_liste(prefixe, elements):
 
 def generer_synthese_locale(texte, fichier=None, longueur_max=1000):
     """Produit une synthèse structurée, précise et ancrée dans le contenu du fichier."""
-    texte = nettoyer_texte(texte)
     analyse = analyser_document(texte, fichier=fichier)
     mots_cles = analyse["mots_cles"]
     if not mots_cles and not analyse["montants"]:
@@ -740,16 +739,17 @@ def generer_resume_texte(
     utiliser_ia=True et qu'un modèle transformers est disponible, elle tente
     d'abord un résumé abstractive puis revient à la synthèse locale en fallback.
     """
-    texte = nettoyer_texte(texte)
-    if not texte:
+    texte_original = texte
+    texte_nettoye = nettoyer_texte(texte_original)
+    if not texte_nettoye:
         return ""
 
     if utiliser_ia:
-        resume_ia = generer_resume_ia(texte, longueur_max=longueur_max)
+        resume_ia = generer_resume_ia(texte_nettoye, longueur_max=longueur_max)
         if resume_ia:
             return resume_ia
 
-    return generer_synthese_locale(texte, fichier=fichier, longueur_max=longueur_max)
+    return generer_synthese_locale(texte_original, fichier=fichier, longueur_max=longueur_max)
 
 
 def generer_resume_fichier(fichier, utiliser_ia=False):
