@@ -151,8 +151,31 @@ def extraire_texte_pdf(fichier, max_pages=20):
     return extraire_texte_pdf_ocr(fichier, max_pages=max_pages)
 
 
+def preparer_variantes_ocr(image):
+    """Crée plusieurs versions optimisées d'une image pour améliorer l'OCR."""
+    try:
+        from PIL import ImageEnhance, ImageFilter, ImageOps
+    except ImportError:
+        return [image.convert("RGB")]
+
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    largeur, hauteur = image.size
+    facteur = max(1, int(1400 / max(largeur, 1))) if largeur < 1400 else 1
+    if facteur > 1:
+        image = image.resize((largeur * facteur, hauteur * facteur))
+
+    gris = ImageOps.grayscale(image)
+    contraste = ImageEnhance.Contrast(gris).enhance(2.0)
+    nettete = ImageEnhance.Sharpness(contraste).enhance(1.8)
+    seuil = nettete.point(lambda pixel: 255 if pixel > 170 else 0)
+    inverse = ImageOps.invert(seuil)
+    adoucie = nettete.filter(ImageFilter.MedianFilter(size=3))
+
+    return [image, gris, contraste, nettete, seuil, inverse, adoucie]
+
+
 def executer_ocr_image(image, langues=OCR_LANGUES):
-    """Lance Tesseract sur une image PIL et essaie un fallback si la langue manque."""
+    """Lance Tesseract sur plusieurs variantes et conserve le meilleur texte."""
     try:
         import pytesseract
     except ImportError:
@@ -163,17 +186,30 @@ def executer_ocr_image(image, langues=OCR_LANGUES):
         langues_a_tester.append("eng")
     langues_a_tester.append(None)
 
-    for langue in langues_a_tester:
-        try:
-            if langue:
-                texte = pytesseract.image_to_string(image, lang=langue)
-            else:
-                texte = pytesseract.image_to_string(image)
-        except Exception:
-            continue
-        if texte.strip():
-            return texte
-    return ""
+    configurations = [
+        "--oem 3 --psm 6",
+        "--oem 3 --psm 4",
+        "--oem 3 --psm 11",
+        "--oem 3 --psm 12",
+        "",
+    ]
+
+    meilleur_texte = ""
+    for variante in preparer_variantes_ocr(image):
+        for langue in langues_a_tester:
+            for configuration in configurations:
+                try:
+                    options = {"config": configuration} if configuration else {}
+                    if langue:
+                        texte = pytesseract.image_to_string(variante, lang=langue, **options)
+                    else:
+                        texte = pytesseract.image_to_string(variante, **options)
+                except Exception:
+                    continue
+                texte = nettoyer_texte(texte)
+                if len(texte) > len(meilleur_texte):
+                    meilleur_texte = texte
+    return meilleur_texte
 
 
 def extraire_texte_image_ocr(fichier, langues=OCR_LANGUES):
@@ -185,7 +221,7 @@ def extraire_texte_image_ocr(fichier, langues=OCR_LANGUES):
 
     try:
         with Image.open(fichier) as image:
-            return executer_ocr_image(image.convert("RGB"), langues=langues)
+            return executer_ocr_image(image, langues=langues)
     except Exception:
         return ""
 
@@ -389,22 +425,160 @@ def joindre_liste(elements):
     return ", ".join(elements[:-1]) + " et " + elements[-1]
 
 
-def detecter_profil_document(texte, fichier=None):
-    """Déduit le type probable du document à partir de son vocabulaire."""
+def lignes_significatives(texte, limite=120):
+    """Retourne les lignes utiles pour repérer titres, en-têtes et pieds de page."""
+    lignes = []
+    for ligne in texte.splitlines():
+        ligne = nettoyer_texte(ligne)
+        if not ligne or len(ligne) < 2:
+            continue
+        if re.fullmatch(r"[-_=|\s]+", ligne):
+            continue
+        lignes.append(ligne)
+        if len(lignes) >= limite:
+            break
+    if lignes:
+        return lignes
+    return decouper_en_phrases(texte)[:limite]
+
+
+def raccourcir(element, limite=140):
+    """Raccourcit une ligne de contexte sans la dénaturer."""
+    element = nettoyer_texte(element)
+    if len(element) <= limite:
+        return element
+    return element[:limite].rsplit(" ", 1)[0].rstrip(" .,;:") + "..."
+
+
+def liste_unique(elements, limite=6):
+    """Conserve l'ordre en supprimant les doublons."""
+    resultat = []
+    vus = set()
+    for element in elements:
+        element = raccourcir(element)
+        cle = element.lower()
+        if element and cle not in vus:
+            resultat.append(element)
+            vus.add(cle)
+        if len(resultat) >= limite:
+            break
+    return resultat
+
+
+def detecter_titre(lignes):
+    """Cherche un titre explicite dans les premières lignes du document."""
+    mots_titre = ("facture", "invoice", "contrat", "devis", "reçu", "receipt", "convention", "attestation")
+    candidates = lignes[:15]
+    for ligne in candidates:
+        if any(mot in ligne.lower() for mot in mots_titre):
+            return raccourcir(ligne, limite=100)
+    for ligne in candidates:
+        if 4 <= len(ligne) <= 100 and not re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", ligne):
+            return raccourcir(ligne, limite=100)
+    return ""
+
+
+def extraire_montants_contextualises(texte, limite=8):
+    """Extrait les montants et leur ligne de contexte pour les factures/contrats."""
+    motif_montant = re.compile(
+        r"(?i)(?:€|\$|usd|eur|euros?|fcfa|xaf|xof)?\s*"
+        r"(?:\d{1,3}(?:[ . ,]\d{3})+|\d+)"
+        r"(?:[,.]\d{2})?\s*"
+        r"(?:€|\$|usd|eur|euros?|fcfa|xaf|xof)?"
+    )
+    lignes = lignes_significatives(texte, limite=250)
+    montants = []
+    mots_financiers = (
+        "total", "ttc", "ht", "tva", "montant", "prix", "payer", "solde",
+        "acompte", "remise", "facture", "devis", "honoraires", "loyer", "dépôt",
+    )
+    for ligne in lignes:
+        if not motif_montant.search(ligne):
+            continue
+        contexte_financier = any(mot in ligne.lower() for mot in mots_financiers)
+        contient_devise = re.search(r"(?i)(€|\$|usd|eur|euro|fcfa|xaf|xof)", ligne)
+        if contexte_financier or contient_devise:
+            montants.append(ligne)
+    if not montants:
+        montants = [match.group(0) for match in motif_montant.finditer(texte) if match.group(0).strip()]
+    return liste_unique(montants, limite=limite)
+
+
+def extraire_dates(texte, limite=5):
+    """Extrait les dates courantes du document."""
+    mois = "janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|septembre|octobre|novembre|décembre|decembre"
+    motifs = [
+        rf"\d{{1,2}}\s+(?:{mois})\s+\d{{4}}",
+        r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}",
+        r"\d{4}-\d{2}-\d{2}",
+    ]
+    dates = []
+    for motif in motifs:
+        dates.extend(re.findall(motif, texte, flags=re.IGNORECASE))
+    return liste_unique(dates, limite=limite)
+
+
+def extraire_references(texte, limite=6):
+    """Extrait les lignes qui ressemblent à des références documentaires."""
+    mots_reference = (
+        "facture", "invoice", "devis", "contrat", "référence", "reference", "ref",
+        "n°", "no", "numéro", "numero", "siret", "siren", "commande", "client",
+    )
+    lignes = lignes_significatives(texte, limite=220)
+    refs = [ligne for ligne in lignes if any(mot in ligne.lower() for mot in mots_reference)]
+    return liste_unique(refs, limite=limite)
+
+
+def extraire_parties(texte, limite=5):
+    """Repère des lignes décrivant client, fournisseur ou parties contractantes."""
+    mots_parties = (
+        "client", "fournisseur", "vendeur", "acheteur", "société", "societe",
+        "entre ", "représenté", "represente", "prestataire", "bénéficiaire", "beneficiaire",
+    )
+    lignes = lignes_significatives(texte, limite=180)
+    parties = [ligne for ligne in lignes if any(mot in ligne.lower() for mot in mots_parties)]
+    return liste_unique(parties, limite=limite)
+
+
+def detecter_profil_document(texte, fichier=None, montants=None):
+    """Déduit le type probable du document à partir du vocabulaire et des montants."""
     extension = fichier.suffix.lower() if fichier else ""
     texte_min = texte.lower()
+    montants = montants or []
+
+    score_facture = sum(
+        1
+        for mot in ("facture", "invoice", "devis", "reçu", "receipt", "tva", "ttc", "ht", "net à payer", "total")
+        if mot in texte_min
+    )
+    score_contrat = sum(
+        1
+        for mot in ("contrat", "convention", "accord", "clause", "signature", "article", "parties", "soussigné", "durée")
+        if mot in texte_min
+    )
+
+    if extension in {".csv", ".xlsx", ".xls"} or " | " in texte:
+        return (
+            "un jeu de données ou tableau",
+            "organiser des informations sous forme de lignes, colonnes ou valeurs comparables",
+        )
+    if score_facture >= 2 or (score_facture >= 1 and montants):
+        return (
+            "une facture, un devis ou un document de paiement",
+            "identifier une transaction, les sommes à payer et les références de facturation",
+        )
+    if score_contrat >= 2:
+        return (
+            "un contrat ou document d'engagement",
+            "formaliser les parties, les obligations, les dates et les éventuelles conditions financières",
+        )
+    if montants:
+        return (
+            "un document contenant des informations financières",
+            "mettre en évidence des montants et leur contexte",
+        )
 
     profils = [
-        (
-            "un document administratif ou contractuel",
-            "formaliser des informations, des engagements ou des éléments de suivi",
-            {"contrat", "signature", "article", "clause", "client", "adresse", "document"},
-        ),
-        (
-            "un document financier ou commercial",
-            "présenter des montants, des transactions ou des informations de facturation",
-            {"facture", "montant", "total", "tva", "prix", "paiement", "devis", "commande"},
-        ),
         (
             "un contenu technique",
             "expliquer un fonctionnement, une procédure ou une logique de traitement",
@@ -417,12 +591,6 @@ def detecter_profil_document(texte, fichier=None):
         ),
     ]
 
-    if extension in {".csv", ".xlsx", ".xls"} or " | " in texte:
-        return (
-            "un jeu de données ou tableau",
-            "organiser des informations sous forme de lignes, colonnes ou valeurs comparables",
-        )
-
     meilleur_profil = ("un document général", "présenter les informations principales du contenu")
     meilleur_score = 0
     for libelle, objectif, mots_cles in profils:
@@ -431,6 +599,26 @@ def detecter_profil_document(texte, fichier=None):
             meilleur_score = score
             meilleur_profil = (libelle, objectif)
     return meilleur_profil
+
+
+def analyser_document(texte, fichier=None):
+    """Analyse le contenu pour produire une synthèse ancrée dans le document."""
+    lignes = lignes_significatives(texte)
+    montants = extraire_montants_contextualises(texte)
+    profil, objectif = detecter_profil_document(texte, fichier=fichier, montants=montants)
+    return {
+        "profil": profil,
+        "objectif": objectif,
+        "titre": detecter_titre(lignes),
+        "entete": liste_unique(lignes[:5], limite=3),
+        "pied": liste_unique(lignes[-5:], limite=3),
+        "montants": montants,
+        "dates": extraire_dates(texte),
+        "references": extraire_references(texte),
+        "parties": extraire_parties(texte),
+        "mots_cles": extraire_mots_significatifs(texte),
+        "nombre_lignes": len(lignes),
+    }
 
 
 def limiter_texte(texte, longueur_max):
@@ -442,7 +630,7 @@ def limiter_texte(texte, longueur_max):
     return coupe.rstrip(" .,;") + "..."
 
 
-def generer_resume_ia(texte, longueur_max=700):
+def generer_resume_ia(texte, longueur_max=1000):
     """Utilise un modèle de résumé si transformers est installé et configuré."""
     global _PIPELINE_RESUME
 
@@ -457,8 +645,8 @@ def generer_resume_ia(texte, longueur_max=700):
             _PIPELINE_RESUME = pipeline("summarization", model=modele)
         resultat = _PIPELINE_RESUME(
             texte[:4500],
-            max_length=min(180, max(60, longueur_max // 4)),
-            min_length=25,
+            max_length=min(220, max(80, longueur_max // 4)),
+            min_length=35,
             do_sample=False,
         )
     except Exception:
@@ -477,40 +665,71 @@ def formater_objectif(objectif):
     return f"de {objectif}"
 
 
-def generer_synthese_locale(texte, fichier=None, longueur_max=700):
-    """Produit une synthèse reformulée sans recopier les phrases du fichier."""
+def phrase_liste(prefixe, elements):
+    """Construit une phrase uniquement si des éléments fiables sont disponibles."""
+    if not elements:
+        return ""
+    return f"{prefixe} {joindre_liste(elements)}."
+
+
+def generer_synthese_locale(texte, fichier=None, longueur_max=1000):
+    """Produit une synthèse structurée, précise et ancrée dans le contenu du fichier."""
     texte = nettoyer_texte(texte)
-    mots_cles = extraire_mots_significatifs(texte)
-    if not mots_cles:
+    analyse = analyser_document(texte, fichier=fichier)
+    mots_cles = analyse["mots_cles"]
+    if not mots_cles and not analyse["montants"]:
         return "Le contenu contient trop peu de texte exploitable pour produire une synthèse fiable."
 
-    profil, objectif = detecter_profil_document(texte, fichier=fichier)
-    themes_principaux = joindre_liste(mots_cles[:3])
-    themes_secondaires = joindre_liste(mots_cles[3:7])
-    nombre_phrases = len(decouper_en_phrases(texte))
+    profil = analyse["profil"]
+    objectif = analyse["objectif"]
+    titre = analyse["titre"]
+    themes_principaux = joindre_liste(mots_cles[:4])
 
-    if len(texte) < 300 or nombre_phrases <= 2:
-        synthese = (
-            f"Ce contenu court semble être {profil} centré sur {themes_principaux}. "
-            f"Il fournit surtout une information rapide autour de {themes_secondaires}, "
-            f"avec pour objectif probable {formater_objectif(objectif)}."
-        )
+    morceaux = []
+    if titre:
+        morceaux.append(f"Document identifié comme {profil}, avec comme titre ou en-tête principal : « {titre} ».")
     else:
-        synthese = (
-            f"Ce document semble être {profil} centré sur {themes_principaux}. "
-            f"Il met en relation plusieurs éléments autour de {themes_secondaires}, "
-            f"ce qui indique que son objectif principal est {formater_objectif(objectif)}. "
-            f"En résumé, il sert surtout à donner une vue structurée des thèmes suivants : {themes_principaux}, "
-            "et à faciliter l'exploitation de ces informations."
+        morceaux.append(f"Document identifié comme {profil}.")
+
+    if analyse["references"]:
+        morceaux.append(phrase_liste("Références ou lignes d'identification repérées :", analyse["references"][:3]))
+    elif analyse["entete"]:
+        morceaux.append(phrase_liste("Indices d'en-tête repérés :", analyse["entete"][:3]))
+
+    if analyse["parties"]:
+        morceaux.append(phrase_liste("Parties ou acteurs mentionnés :", analyse["parties"][:3]))
+
+    if analyse["montants"]:
+        morceaux.append(phrase_liste("Sommes d'argent détectées avec leur contexte :", analyse["montants"][:5]))
+
+    if analyse["dates"]:
+        morceaux.append(phrase_liste("Dates importantes visibles :", analyse["dates"][:4]))
+
+    if "facture" in profil or "paiement" in profil:
+        morceaux.append(
+            f"L'objectif du document est {formater_objectif(objectif)} ; les montants ci-dessus doivent donc être considérés comme des éléments centraux du résumé."
+        )
+    elif "contrat" in profil or "engagement" in profil:
+        if analyse["montants"]:
+            morceaux.append(
+                "Comme il s'agit d'un engagement, les montants indiquent probablement des conditions financières, frais, paiements ou pénalités à vérifier."
+            )
+        morceaux.append(f"L'objectif du document est {formater_objectif(objectif)}.")
+    else:
+        morceaux.append(
+            f"Le contenu porte principalement sur {themes_principaux} et sert à {objectif}."
         )
 
-    return limiter_texte(synthese, longueur_max)
+    if analyse["pied"] and analyse["pied"] != analyse["entete"]:
+        morceaux.append(phrase_liste("Éléments de pied de page ou de fin du document :", analyse["pied"][:2]))
+
+    return limiter_texte(" ".join(morceaux), longueur_max)
 
 
 def generer_resume_texte(
     texte,
     nombre_phrases=3,
-    longueur_max=700,
+    longueur_max=1000,
     fichier=None,
     utiliser_ia=False,
 ):
