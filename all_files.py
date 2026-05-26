@@ -995,6 +995,12 @@ def generer_synthese_locale(
 
     if analyse["evidence_titre"]:
         morceaux.append(f"Titre ou en-tête principal : {citation_evidence(analyse['evidence_titre'])}.")
+        evidences_entete_restantes = [
+            evidence
+            for evidence in analyse["evidences_entete"]
+            if evidence.get("ligne") != analyse["evidence_titre"].get("ligne")
+        ]
+        ajouter_section_evidence(morceaux, "Extraits clés du début du document :", evidences_entete_restantes, limite=3)
     else:
         ajouter_section_evidence(morceaux, "Indices d'en-tête :", analyse["evidences_entete"], limite=3)
 
