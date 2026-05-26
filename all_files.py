@@ -82,7 +82,9 @@ MOTS_VIDES = {
 OCR_LANGUES = "fra+eng"
 AVERTISSEMENT_PDF_DICTIONNAIRE = "Multiple definitions in dictionary"
 RESUME_MODELE_DEFAUT = "csebuetnlp/mT5_multilingual_XLSum"
+DETECTION_MODELE_DEFAUT = "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli"
 _PIPELINE_RESUME = None
+_PIPELINE_DETECTION = None
 
 
 def formater_taille(taille):
@@ -488,19 +490,20 @@ def extraire_montants_contextualises(texte, limite=8):
     )
     lignes = lignes_significatives(texte, limite=250)
     montants = []
-    mots_financiers = (
-        "total", "ttc", "ht", "tva", "montant", "prix", "payer", "solde",
-        "acompte", "remise", "honoraires", "loyer", "dépôt", "somme", "frais",
+    mots_financiers_forts = (
+        "ttc", "ht", "tva", "montant", "prix", "payer", "solde", "acompte",
+        "remise", "honoraires", "loyer", "dépôt", "somme", "frais", "net à payer", "net a payer",
     )
+    mots_total_financier = ("total ttc", "total ht", "total à payer", "total a payer")
     for ligne in lignes:
         if not motif_montant.search(ligne):
             continue
-        contexte_financier = any(mot in ligne.lower() for mot in mots_financiers)
+        ligne_min = ligne.lower()
+        contexte_financier = any(mot in ligne_min for mot in mots_financiers_forts)
+        total_financier = any(mot in ligne_min for mot in mots_total_financier)
         contient_devise = re.search(r"(?i)(€|\$|usd|eur|euro|fcfa|xaf|xof)", ligne)
-        if contexte_financier or contient_devise:
+        if contexte_financier or total_financier or contient_devise:
             montants.append(ligne)
-    if not montants:
-        montants = [match.group(0) for match in motif_montant.finditer(texte) if match.group(0).strip()]
     return liste_unique(montants, limite=limite)
 
 
@@ -521,8 +524,8 @@ def extraire_dates(texte, limite=5):
 def extraire_references(texte, limite=6):
     """Extrait les lignes qui ressemblent à des références documentaires."""
     mots_reference = (
-        "facture", "invoice", "devis", "contrat", "référence", "reference", "ref",
-        "n°", "no", "numéro", "numero", "siret", "siren", "commande", "client",
+        "facture", "invoice", "devis", "contrat", "référence", "reference", "réf",
+        "n°", "numéro", "numero", "siret", "siren", "commande", "client",
     )
     lignes = lignes_significatives(texte, limite=220)
     refs = [ligne for ligne in lignes if any(mot in ligne.lower() for mot in mots_reference)]
@@ -540,78 +543,260 @@ def extraire_parties(texte, limite=5):
     return liste_unique(parties, limite=limite)
 
 
-def detecter_profil_document(texte, fichier=None, montants=None):
-    """Déduit le type probable du document à partir du vocabulaire et des montants."""
-    extension = fichier.suffix.lower() if fichier else ""
+def extraire_extrait_detection(texte, limite=3500):
+    """Prépare un extrait représentatif pour la classification du document."""
+    lignes = lignes_significatives(texte, limite=160)
+    debut = lignes[:35]
+    fin = lignes[-15:] if len(lignes) > 35 else []
+    lignes_argent = extraire_montants_contextualises(texte, limite=10)
+    extrait = "\n".join(liste_unique(debut + lignes_argent + fin, limite=70))
+    return extrait[:limite]
+
+
+def indices_facture(texte, montants=None):
+    """Vérifie que le contenu contient de vrais indices de facture/devis."""
     texte_min = texte.lower()
     montants = montants or []
-
-    score_facture = sum(
-        1
-        for mot in ("facture", "invoice", "devis", "reçu", "receipt", "tva", "ttc", "ht", "net à payer", "total")
-        if mot in texte_min
+    mots_forts = (
+        "facture", "invoice", "devis", "avoir", "proforma", "bon de commande",
+        "reçu", "receipt", "net à payer", "net a payer",
     )
-    score_contrat = sum(
-        1
-        for mot in ("contrat", "convention", "accord", "clause", "signature", "article", "parties", "soussigné", "durée")
-        if mot in texte_min
+    mots_financiers = ("tva", "ttc", "ht", "total", "montant", "paiement", "échéance", "echeance")
+    return any(mot in texte_min for mot in mots_forts) and (
+        bool(montants) or sum(1 for mot in mots_financiers if mot in texte_min) >= 2
     )
 
-    if extension in {".csv", ".xlsx", ".xls"} or " | " in texte:
-        return (
-            "un jeu de données ou tableau",
-            "organiser des informations sous forme de lignes, colonnes ou valeurs comparables",
-        )
-    if score_facture >= 2 or (score_facture >= 1 and montants):
-        return (
+
+def indices_contrat(texte):
+    """Vérifie que le contenu contient de vrais indices de contrat/engagement."""
+    texte_min = texte.lower()
+    mots_contrat = (
+        "contrat", "convention", "accord", "clause", "article", "signature",
+        "parties", "soussigné", "soussignes", "durée", "obligations", "résiliation",
+    )
+    return sum(1 for mot in mots_contrat if mot in texte_min) >= 2
+
+
+def indices_tableau(texte, fichier=None):
+    """Détecte un document tabulaire sans le confondre avec une facture."""
+    extension = fichier.suffix.lower() if fichier else ""
+    return extension in {".csv", ".xlsx", ".xls"} or " | " in texte
+
+
+def profil_depuis_categorie(categorie):
+    """Convertit une catégorie de classification en profil et objectif métier."""
+    mapping = {
+        "facture_devis": (
             "une facture, un devis ou un document de paiement",
             "identifier une transaction, les sommes à payer et les références de facturation",
-        )
-    if score_contrat >= 2:
-        return (
+        ),
+        "contrat": (
             "un contrat ou document d'engagement",
             "formaliser les parties, les obligations, les dates et les éventuelles conditions financières",
-        )
-    if montants:
-        return (
+        ),
+        "document_financier": (
             "un document contenant des informations financières",
-            "mettre en évidence des montants et leur contexte",
-        )
-
-    profils = [
-        (
+            "mettre en évidence les montants, leur contexte et les éléments de suivi financier",
+        ),
+        "tableau": (
+            "un jeu de données ou tableau",
+            "organiser des informations sous forme de lignes, colonnes ou valeurs comparables",
+        ),
+        "technique": (
             "un contenu technique",
             "expliquer un fonctionnement, une procédure ou une logique de traitement",
-            {"python", "code", "fonction", "fichier", "dossier", "erreur", "système", "traitement"},
         ),
-        (
+        "pedagogique": (
             "un support pédagogique ou documentaire",
             "transmettre des connaissances ou structurer une explication",
-            {"chapitre", "cours", "exemple", "méthode", "apprendre", "question", "réponse", "notion"},
         ),
+        "administratif": (
+            "un document administratif ou opérationnel",
+            "présenter des informations de gestion, de suivi ou d'organisation",
+        ),
+        "general": (
+            "un document général",
+            "présenter les informations principales du contenu",
+        ),
+    }
+    return mapping.get(categorie, mapping["general"])
+
+
+def normaliser_categorie_llm(label):
+    """Rattache le libellé LLM à une catégorie interne stable."""
+    label = label.lower()
+    if "facture" in label or "devis" in label or "paiement" in label or "reçu" in label:
+        return "facture_devis"
+    if "contrat" in label or "convention" in label or "engagement" in label:
+        return "contrat"
+    if "financier" in label or "bancaire" in label:
+        return "document_financier"
+    if "tableau" in label or "données" in label or "donnees" in label:
+        return "tableau"
+    if "technique" in label:
+        return "technique"
+    if "pédagogique" in label or "pedagogique" in label or "cours" in label:
+        return "pedagogique"
+    if "administratif" in label or "rapport" in label:
+        return "administratif"
+    return "general"
+
+
+def classement_llm_valide(categorie, score, texte, fichier=None, montants=None):
+    """Empêche le LLM de surclasser un document sans indices concrets."""
+    montants = montants or []
+    if score < 0.55:
+        return False
+    if categorie == "facture_devis":
+        return indices_facture(texte, montants)
+    if categorie == "contrat":
+        return indices_contrat(texte)
+    if categorie == "document_financier":
+        return bool(montants) and score >= 0.60
+    if categorie == "tableau":
+        return indices_tableau(texte, fichier=fichier) or score >= 0.75
+    return score >= 0.60
+
+
+def detecter_profil_document_llm(texte, fichier=None, montants=None):
+    """Utilise un modèle zero-shot LLM pour classifier le document si disponible."""
+    global _PIPELINE_DETECTION
+
+    try:
+        from transformers import pipeline
+    except ImportError:
+        return None
+
+    modele = os.getenv("DETECTION_MODELE", DETECTION_MODELE_DEFAUT)
+    labels = [
+        "facture, devis ou document de paiement",
+        "contrat, convention ou document d'engagement",
+        "document financier non facturier",
+        "tableau ou jeu de données",
+        "document technique",
+        "support pédagogique ou cours",
+        "rapport ou document administratif",
+        "document général",
     ]
+    extrait = extraire_extrait_detection(texte)
+    if not extrait:
+        return None
 
-    meilleur_profil = ("un document général", "présenter les informations principales du contenu")
-    meilleur_score = 0
-    for libelle, objectif, mots_cles in profils:
-        score = sum(1 for mot in mots_cles if mot in texte_min)
-        if score > meilleur_score:
-            meilleur_score = score
-            meilleur_profil = (libelle, objectif)
-    return meilleur_profil
+    try:
+        if _PIPELINE_DETECTION is None:
+            _PIPELINE_DETECTION = pipeline(
+                "zero-shot-classification",
+                model=modele,
+            )
+        resultat = _PIPELINE_DETECTION(
+            extrait,
+            candidate_labels=labels,
+            hypothesis_template="Ce document est {}.",
+            multi_label=False,
+        )
+    except Exception:
+        return None
 
+    if not resultat or not resultat.get("labels"):
+        return None
 
-def analyser_document(texte, fichier=None):
-    """Analyse le contenu pour produire une synthèse ancrée dans le document."""
-    lignes = lignes_significatives(texte)
-    montants = extraire_montants_contextualises(texte)
-    profil, objectif = detecter_profil_document(texte, fichier=fichier, montants=montants)
+    label = resultat["labels"][0]
+    score = float(resultat.get("scores", [0])[0])
+    categorie = normaliser_categorie_llm(label)
+    if not classement_llm_valide(categorie, score, texte, fichier=fichier, montants=montants):
+        return None
+
+    profil, objectif = profil_depuis_categorie(categorie)
     return {
         "profil": profil,
         "objectif": objectif,
+        "categorie": categorie,
+        "source": "llm",
+        "score": score,
+        "label": label,
+    }
+
+
+def detecter_profil_document(texte, fichier=None, montants=None, utiliser_llm_detection=True):
+    """Déduit le type probable du document après lecture du contenu."""
+    montants = montants or []
+
+    if utiliser_llm_detection:
+        detection_llm = detecter_profil_document_llm(texte, fichier=fichier, montants=montants)
+        if detection_llm:
+            return detection_llm
+
+    texte_min = texte.lower()
+
+    if indices_tableau(texte, fichier=fichier):
+        profil, objectif = profil_depuis_categorie("tableau")
+        return {"profil": profil, "objectif": objectif, "categorie": "tableau", "source": "heuristique", "score": 1.0}
+
+    if indices_facture(texte, montants):
+        profil, objectif = profil_depuis_categorie("facture_devis")
+        return {"profil": profil, "objectif": objectif, "categorie": "facture_devis", "source": "heuristique", "score": 1.0}
+
+    if indices_contrat(texte):
+        profil, objectif = profil_depuis_categorie("contrat")
+        return {"profil": profil, "objectif": objectif, "categorie": "contrat", "source": "heuristique", "score": 1.0}
+
+    if montants:
+        profil, objectif = profil_depuis_categorie("document_financier")
+        return {"profil": profil, "objectif": objectif, "categorie": "document_financier", "source": "heuristique", "score": 0.85}
+
+    profils = [
+        (
+            "technique",
+            {"python", "code", "fonction", "fichier", "dossier", "erreur", "système", "traitement"},
+        ),
+        (
+            "pedagogique",
+            {"chapitre", "cours", "exemple", "méthode", "apprendre", "question", "réponse", "notion"},
+        ),
+        (
+            "administratif",
+            {"rapport", "note", "procédure", "demande", "service", "suivi", "organisation"},
+        ),
+    ]
+
+    meilleure_categorie = "general"
+    meilleur_score = 0
+    for categorie, mots_cles in profils:
+        score = sum(1 for mot in mots_cles if mot in texte_min)
+        if score > meilleur_score:
+            meilleur_score = score
+            meilleure_categorie = categorie
+
+    profil, objectif = profil_depuis_categorie(meilleure_categorie)
+    return {
+        "profil": profil,
+        "objectif": objectif,
+        "categorie": meilleure_categorie,
+        "source": "heuristique",
+        "score": meilleur_score,
+    }
+
+
+def analyser_document(texte, fichier=None, utiliser_llm_detection=True):
+    """Analyse le contenu pour produire une synthèse ancrée dans le document."""
+    lignes = lignes_significatives(texte)
+    montants = extraire_montants_contextualises(texte)
+    detection = detecter_profil_document(
+        texte,
+        fichier=fichier,
+        montants=montants,
+        utiliser_llm_detection=utiliser_llm_detection,
+    )
+    return {
+        "profil": detection["profil"],
+        "objectif": detection["objectif"],
+        "categorie": detection["categorie"],
+        "source_detection": detection["source"],
+        "score_detection": detection["score"],
+        "label_detection": detection.get("label", ""),
         "titre": detecter_titre(lignes),
         "entete": liste_unique(lignes[:5], limite=3),
-        "pied": liste_unique([ligne for ligne in lignes[-5:] if ligne not in montants], limite=3),
+        "pied": liste_unique([ligne for ligne in lignes[-5:] if ligne not in montants], limite=3) if len(lignes) > 5 else [],
         "montants": montants,
         "dates": extraire_dates(texte),
         "references": extraire_references(texte),
@@ -672,9 +857,18 @@ def phrase_liste(prefixe, elements):
     return f"{prefixe} {joindre_liste(elements)}."
 
 
-def generer_synthese_locale(texte, fichier=None, longueur_max=1000):
+def generer_synthese_locale(
+    texte,
+    fichier=None,
+    longueur_max=1000,
+    utiliser_llm_detection=True,
+):
     """Produit une synthèse structurée, précise et ancrée dans le contenu du fichier."""
-    analyse = analyser_document(texte, fichier=fichier)
+    analyse = analyser_document(
+        texte,
+        fichier=fichier,
+        utiliser_llm_detection=utiliser_llm_detection,
+    )
     mots_cles = analyse["mots_cles"]
     if not mots_cles and not analyse["montants"]:
         return "Le contenu contient trop peu de texte exploitable pour produire une synthèse fiable."
@@ -704,11 +898,11 @@ def generer_synthese_locale(texte, fichier=None, longueur_max=1000):
     if analyse["dates"]:
         morceaux.append(phrase_liste("Dates importantes visibles :", analyse["dates"][:4]))
 
-    if "facture" in profil or "paiement" in profil:
+    if analyse["categorie"] == "facture_devis":
         morceaux.append(
             f"L'objectif du document est {formater_objectif(objectif)} ; les montants ci-dessus doivent donc être considérés comme des éléments centraux du résumé."
         )
-    elif "contrat" in profil or "engagement" in profil:
+    elif analyse["categorie"] == "contrat":
         if analyse["montants"]:
             morceaux.append(
                 "Comme il s'agit d'un engagement, les montants indiquent probablement des conditions financières, frais, paiements ou pénalités à vérifier."
@@ -731,6 +925,7 @@ def generer_resume_texte(
     longueur_max=1000,
     fichier=None,
     utiliser_ia=False,
+    utiliser_llm_detection=True,
 ):
     """
     Génère un résumé réaliste en reformulant le contenu.
@@ -749,14 +944,24 @@ def generer_resume_texte(
         if resume_ia:
             return resume_ia
 
-    return generer_synthese_locale(texte_original, fichier=fichier, longueur_max=longueur_max)
+    return generer_synthese_locale(
+        texte_original,
+        fichier=fichier,
+        longueur_max=longueur_max,
+        utiliser_llm_detection=utiliser_llm_detection,
+    )
 
 
-def generer_resume_fichier(fichier, utiliser_ia=False):
+def generer_resume_fichier(fichier, utiliser_ia=False, utiliser_llm_detection=True):
     """Génère une synthèse réaliste d'un fichier collecté à partir de son contenu."""
     texte = extraire_texte_fichier(fichier)
     if texte:
-        return generer_resume_texte(texte, fichier=fichier, utiliser_ia=utiliser_ia)
+        return generer_resume_texte(
+            texte,
+            fichier=fichier,
+            utiliser_ia=utiliser_ia,
+            utiliser_llm_detection=utiliser_llm_detection,
+        )
 
     extension = fichier.suffix.lower()
     if extension in {".png", ".jpg", ".jpeg"}:
@@ -775,6 +980,7 @@ def afficher_avec_statistiques(
     avec_resumes=True,
     max_resumes=None,
     utiliser_ia=False,
+    utiliser_llm_detection=True,
 ):
     """
     Affiche les fichiers avec statistiques par extension et synthèses de contenu.
@@ -846,7 +1052,9 @@ def afficher_avec_statistiques(
                 rel_path = fichier.name
 
             print(f"📄 {rel_path}")
-            print(f"   {generer_resume_fichier(fichier, utiliser_ia=utiliser_ia)}\n")
+            print(
+                f"   {generer_resume_fichier(fichier, utiliser_ia=utiliser_ia, utiliser_llm_detection=utiliser_llm_detection)}\n"
+            )
 
         if max_resumes is not None and len(fichiers) > max_resumes:
             print(f"... et {len(fichiers) - max_resumes} autre(s) fichier(s) non résumé(s)")
