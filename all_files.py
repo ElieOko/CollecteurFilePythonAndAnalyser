@@ -1,6 +1,9 @@
 from collections import Counter
+from contextlib import contextmanager
 import csv
+import logging
 import re
+import warnings
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
@@ -61,6 +64,10 @@ MOTS_VIDES = {
 }
 
 
+OCR_LANGUES = "fra+eng"
+AVERTISSEMENT_PDF_DICTIONNAIRE = "Multiple definitions in dictionary"
+
+
 def formater_taille(taille):
     """Formate une taille en octets vers une valeur lisible."""
     if taille < 1024:
@@ -86,23 +93,113 @@ def collecter_fichiers(dossier, recursif=True, extensions=None):
     ]
 
 
+@contextmanager
+def ignorer_avertissements_pypdf():
+    """Réduit le bruit des PDF mal formés que pypdf sait quand même lire."""
+    logger = logging.getLogger("pypdf")
+    ancien_niveau = logger.level
+    logger.setLevel(logging.ERROR)
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=f".*{AVERTISSEMENT_PDF_DICTIONNAIRE}.*",
+            )
+            yield
+    finally:
+        logger.setLevel(ancien_niveau)
+
+
 def extraire_texte_pdf(fichier, max_pages=20):
-    """Extrait le texte d'un PDF avec pypdf si la librairie est disponible."""
+    """Extrait le texte d'un PDF, avec fallback OCR si le texte n'est pas lisible."""
     try:
         from pypdf import PdfReader
+    except ImportError:
+        return extraire_texte_pdf_ocr(fichier, max_pages=max_pages)
+
+    try:
+        with ignorer_avertissements_pypdf():
+            reader = PdfReader(str(fichier), strict=False)
+            textes = []
+            for page in list(reader.pages)[:max_pages]:
+                texte_page = page.extract_text() or ""
+                if texte_page.strip():
+                    textes.append(texte_page)
+            texte = "\n".join(textes)
+    except Exception:
+        return extraire_texte_pdf_ocr(fichier, max_pages=max_pages)
+
+    if texte.strip():
+        return texte
+    return extraire_texte_pdf_ocr(fichier, max_pages=max_pages)
+
+
+def executer_ocr_image(image, langues=OCR_LANGUES):
+    """Lance Tesseract sur une image PIL et essaie un fallback si la langue manque."""
+    try:
+        import pytesseract
+    except ImportError:
+        return ""
+
+    langues_a_tester = [langues]
+    if langues != "eng":
+        langues_a_tester.append("eng")
+    langues_a_tester.append(None)
+
+    for langue in langues_a_tester:
+        try:
+            if langue:
+                texte = pytesseract.image_to_string(image, lang=langue)
+            else:
+                texte = pytesseract.image_to_string(image)
+        except Exception:
+            continue
+        if texte.strip():
+            return texte
+    return ""
+
+
+def extraire_texte_image_ocr(fichier, langues=OCR_LANGUES):
+    """Extrait le texte d'une image avec OCR si Pillow, pytesseract et Tesseract sont disponibles."""
+    try:
+        from PIL import Image
     except ImportError:
         return ""
 
     try:
-        reader = PdfReader(fichier)
-        textes = []
-        for page in reader.pages[:max_pages]:
-            texte_page = page.extract_text() or ""
-            if texte_page.strip():
-                textes.append(texte_page)
-        return "\n".join(textes)
+        with Image.open(fichier) as image:
+            return executer_ocr_image(image.convert("RGB"), langues=langues)
     except Exception:
         return ""
+
+
+def extraire_texte_pdf_ocr(fichier, max_pages=20, langues=OCR_LANGUES):
+    """Convertit les pages PDF en images et applique l'OCR quand les outils sont présents."""
+    try:
+        from pdf2image import convert_from_path
+    except ImportError:
+        return ""
+
+    try:
+        images = convert_from_path(
+            str(fichier),
+            dpi=200,
+            first_page=1,
+            last_page=max_pages,
+        )
+    except Exception:
+        return ""
+
+    textes = []
+    for image in images:
+        texte = executer_ocr_image(image, langues=langues)
+        if texte.strip():
+            textes.append(texte)
+        try:
+            image.close()
+        except Exception:
+            pass
+    return "\n".join(textes)
 
 
 def extraire_texte_csv(fichier, max_lignes=80):
@@ -236,6 +333,8 @@ def extraire_texte_fichier(fichier):
         return extraire_texte_xlsx(fichier)
     if extension in {".txt", ".md"}:
         return extraire_texte_simple(fichier)
+    if extension in {".png", ".jpg", ".jpeg"}:
+        return extraire_texte_image_ocr(fichier)
     return ""
 
 
@@ -297,7 +396,9 @@ def generer_resume_fichier(fichier):
 
     extension = fichier.suffix.lower()
     if extension in {".png", ".jpg", ".jpeg"}:
-        return "Résumé indisponible : l'extraction du texte des images nécessite un outil OCR."
+        return "Résumé indisponible : OCR impossible ou aucun texte détecté dans l'image."
+    if extension == ".pdf":
+        return "Résumé indisponible : aucun texte PDF exploitable et OCR PDF non disponible ou sans résultat."
     if extension in {".doc", ".xls"}:
         return "Résumé indisponible : l'ancien format binaire nécessite une librairie spécialisée."
     return "Résumé indisponible : aucun contenu texte exploitable n'a été trouvé."
