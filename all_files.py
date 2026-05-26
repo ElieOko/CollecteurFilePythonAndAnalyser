@@ -444,6 +444,60 @@ def lignes_significatives(texte, limite=120):
     return decouper_en_phrases(texte)[:limite]
 
 
+def lignes_significatives_indexees(texte, limite=180):
+    """Retourne les lignes utiles avec leur numéro pour citer les preuves."""
+    lignes = []
+    for numero, ligne in enumerate(texte.splitlines(), start=1):
+        ligne = nettoyer_texte(ligne)
+        if not ligne or len(ligne) < 2:
+            continue
+        if re.fullmatch(r"[-_=|\s]+", ligne):
+            continue
+        lignes.append({"numero": numero, "texte": ligne})
+        if len(lignes) >= limite:
+            break
+    if lignes:
+        return lignes
+    return [
+        {"numero": index, "texte": phrase}
+        for index, phrase in enumerate(decouper_en_phrases(texte)[:limite], start=1)
+    ]
+
+
+def citation_ligne(numero):
+    """Formate une citation de ligne à la manière des réponses sourcées."""
+    return f"[L{numero}]" if numero else "[ligne non localisée]"
+
+
+def citation_evidence(evidence):
+    """Ajoute la citation de ligne à une preuve extraite."""
+    return f"{evidence['texte']} {citation_ligne(evidence.get('ligne'))}"
+
+
+def trouver_evidence_ligne(lignes_indexees, valeur):
+    """Retrouve la première ligne qui contient une valeur extraite."""
+    valeur_norm = nettoyer_texte(valeur).lower()
+    for ligne in lignes_indexees:
+        if valeur_norm and valeur_norm in ligne["texte"].lower():
+            return {"texte": raccourcir(ligne["texte"]), "ligne": ligne["numero"]}
+    return {"texte": raccourcir(valeur), "ligne": None}
+
+
+def evidences_depuis_valeurs(lignes_indexees, valeurs, limite=5):
+    """Associe des valeurs textuelles à leurs lignes d'origine."""
+    evidences = []
+    vus = set()
+    for valeur in valeurs:
+        evidence = trouver_evidence_ligne(lignes_indexees, valeur)
+        cle = (evidence["texte"].lower(), evidence.get("ligne"))
+        if evidence["texte"] and cle not in vus:
+            evidences.append(evidence)
+            vus.add(cle)
+        if len(evidences) >= limite:
+            break
+    return evidences
+
+
 def raccourcir(element, limite=140):
     """Raccourcit une ligne de contexte sans la dénaturer."""
     element = nettoyer_texte(element)
@@ -511,9 +565,9 @@ def extraire_dates(texte, limite=5):
     """Extrait les dates courantes du document."""
     mois = "janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|septembre|octobre|novembre|décembre|decembre"
     motifs = [
-        rf"\d{{1,2}}\s+(?:{mois})\s+\d{{4}}",
-        r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}",
-        r"\d{4}-\d{2}-\d{2}",
+        rf"\b\d{{1,2}}\s+(?:{mois})\s+\d{{4}}\b",
+        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
+        r"\b\d{4}-\d{2}-\d{2}\b",
     ]
     dates = []
     for motif in motifs:
@@ -780,7 +834,14 @@ def detecter_profil_document(texte, fichier=None, montants=None, utiliser_llm_de
 def analyser_document(texte, fichier=None, utiliser_llm_detection=True):
     """Analyse le contenu pour produire une synthèse ancrée dans le document."""
     lignes = lignes_significatives(texte)
+    lignes_indexees = lignes_significatives_indexees(texte, limite=260)
     montants = extraire_montants_contextualises(texte)
+    dates = extraire_dates(texte)
+    references = extraire_references(texte)
+    parties = extraire_parties(texte)
+    titre = detecter_titre(lignes)
+    entete = liste_unique(lignes[:5], limite=3)
+    pied = liste_unique([ligne for ligne in lignes[-5:] if ligne not in montants], limite=3) if len(lignes) > 5 else []
     detection = detecter_profil_document(
         texte,
         fichier=fichier,
@@ -794,15 +855,23 @@ def analyser_document(texte, fichier=None, utiliser_llm_detection=True):
         "source_detection": detection["source"],
         "score_detection": detection["score"],
         "label_detection": detection.get("label", ""),
-        "titre": detecter_titre(lignes),
-        "entete": liste_unique(lignes[:5], limite=3),
-        "pied": liste_unique([ligne for ligne in lignes[-5:] if ligne not in montants], limite=3) if len(lignes) > 5 else [],
+        "titre": titre,
+        "entete": entete,
+        "pied": pied,
         "montants": montants,
-        "dates": extraire_dates(texte),
-        "references": extraire_references(texte),
-        "parties": extraire_parties(texte),
+        "dates": dates,
+        "references": references,
+        "parties": parties,
         "mots_cles": extraire_mots_significatifs(texte),
         "nombre_lignes": len(lignes),
+        "lignes_indexees": lignes_indexees,
+        "evidence_titre": trouver_evidence_ligne(lignes_indexees, titre) if titre else None,
+        "evidences_entete": evidences_depuis_valeurs(lignes_indexees, entete, limite=3),
+        "evidences_pied": evidences_depuis_valeurs(lignes_indexees, pied, limite=3),
+        "evidences_montants": evidences_depuis_valeurs(lignes_indexees, montants, limite=8),
+        "evidences_dates": evidences_depuis_valeurs(lignes_indexees, dates, limite=5),
+        "evidences_references": evidences_depuis_valeurs(lignes_indexees, references, limite=6),
+        "evidences_parties": evidences_depuis_valeurs(lignes_indexees, parties, limite=5),
     }
 
 
@@ -857,93 +926,131 @@ def phrase_liste(prefixe, elements):
     return f"{prefixe} {joindre_liste(elements)}."
 
 
+def ajouter_section_evidence(morceaux, titre, evidences, limite=5):
+    """Ajoute une section citée uniquement si des preuves existent."""
+    if not evidences:
+        return
+    lignes = [citation_evidence(evidence) for evidence in evidences[:limite]]
+    morceaux.append(f"{titre} " + " ; ".join(lignes) + ".")
+
+
+def informations_manquantes(analyse):
+    """Liste les informations attendues mais non trouvées selon le type détecté."""
+    categorie = analyse["categorie"]
+    manquants = []
+    if categorie == "facture_devis":
+        if not analyse["montants"]:
+            manquants.append("montants")
+        if not analyse["dates"]:
+            manquants.append("date de facture")
+        if not analyse["references"]:
+            manquants.append("numéro ou référence")
+        if not analyse["parties"]:
+            manquants.append("client/fournisseur")
+    elif categorie == "contrat":
+        if not analyse["parties"]:
+            manquants.append("parties signataires")
+        if not analyse["dates"]:
+            manquants.append("date ou durée")
+        if not analyse["montants"]:
+            manquants.append("conditions financières")
+    elif categorie == "document_financier" and not analyse["montants"]:
+        manquants.append("montants exploitables")
+    return manquants
+
+
+def confiance_detection(analyse):
+    """Exprime la confiance sans prétendre à une certitude absolue."""
+    score = analyse.get("score_detection", 0)
+    source = analyse.get("source_detection", "heuristique")
+    if source == "llm":
+        base = "élevée" if score >= 0.75 else "moyenne"
+        return f"{base} (LLM validé par indices du document, score {score:.2f})"
+    if analyse["categorie"] in {"facture_devis", "contrat"}:
+        return "élevée (indices explicites trouvés dans le document)"
+    if analyse["categorie"] == "document_financier":
+        return "moyenne (montants détectés, sans preuve de facture)"
+    return "moyenne (classification prudente basée sur le contenu)"
+
+
 def generer_synthese_locale(
     texte,
     fichier=None,
-    longueur_max=1000,
+    longueur_max=1400,
     utiliser_llm_detection=True,
 ):
-    """Produit une synthèse structurée, précise et ancrée dans le contenu du fichier."""
+    """Produit une synthèse sourcée, vérifiable et limitée aux preuves du fichier."""
     analyse = analyser_document(
         texte,
         fichier=fichier,
         utiliser_llm_detection=utiliser_llm_detection,
     )
-    mots_cles = analyse["mots_cles"]
-    if not mots_cles and not analyse["montants"]:
+    if not analyse["mots_cles"] and not analyse["montants"] and not analyse["titre"]:
         return "Le contenu contient trop peu de texte exploitable pour produire une synthèse fiable."
 
-    profil = analyse["profil"]
-    objectif = analyse["objectif"]
-    titre = analyse["titre"]
-    themes_principaux = joindre_liste(mots_cles[:4])
+    morceaux = [
+        "Résumé vérifié basé uniquement sur le contenu extrait du fichier.",
+        f"Nature détectée : {analyse['profil']} ; confiance {confiance_detection(analyse)}.",
+    ]
 
-    morceaux = []
-    if titre:
-        morceaux.append(f"Document identifié comme {profil}, avec comme titre ou en-tête principal : « {titre} ».")
+    if analyse["evidence_titre"]:
+        morceaux.append(f"Titre ou en-tête principal : {citation_evidence(analyse['evidence_titre'])}.")
     else:
-        morceaux.append(f"Document identifié comme {profil}.")
+        ajouter_section_evidence(morceaux, "Indices d'en-tête :", analyse["evidences_entete"], limite=3)
 
-    if analyse["references"]:
-        morceaux.append(phrase_liste("Références ou lignes d'identification repérées :", analyse["references"][:3]))
-    elif analyse["entete"]:
-        morceaux.append(phrase_liste("Indices d'en-tête repérés :", analyse["entete"][:3]))
-
-    if analyse["parties"]:
-        morceaux.append(phrase_liste("Parties ou acteurs mentionnés :", analyse["parties"][:3]))
-
-    if analyse["montants"]:
-        morceaux.append(phrase_liste("Sommes d'argent détectées avec leur contexte :", analyse["montants"][:5]))
-
-    if analyse["dates"]:
-        morceaux.append(phrase_liste("Dates importantes visibles :", analyse["dates"][:4]))
+    ajouter_section_evidence(morceaux, "Références identifiantes :", analyse["evidences_references"], limite=4)
+    ajouter_section_evidence(morceaux, "Parties ou acteurs cités :", analyse["evidences_parties"], limite=4)
+    ajouter_section_evidence(morceaux, "Dates visibles :", analyse["evidences_dates"], limite=4)
+    ajouter_section_evidence(morceaux, "Montants détectés :", analyse["evidences_montants"], limite=6)
 
     if analyse["categorie"] == "facture_devis":
         morceaux.append(
-            f"L'objectif du document est {formater_objectif(objectif)} ; les montants ci-dessus doivent donc être considérés comme des éléments centraux du résumé."
+            "Interprétation : le fichier ressemble à une facture/devis uniquement parce que des indices de facturation et des montants contextualisés sont présents."
         )
     elif analyse["categorie"] == "contrat":
-        if analyse["montants"]:
-            morceaux.append(
-                "Comme il s'agit d'un engagement, les montants indiquent probablement des conditions financières, frais, paiements ou pénalités à vérifier."
-            )
-        morceaux.append(f"L'objectif du document est {formater_objectif(objectif)}.")
-    else:
         morceaux.append(
-            f"Le contenu porte principalement sur {themes_principaux} et sert à {objectif}."
+            "Interprétation : le fichier ressemble à un contrat car il contient plusieurs indices d'engagement, de parties ou de clauses."
         )
+    elif analyse["categorie"] == "document_financier":
+        morceaux.append(
+            "Interprétation : des montants sont présents, mais les preuves ne suffisent pas à conclure qu'il s'agit d'une facture."
+        )
+    else:
+        themes = joindre_liste(analyse["mots_cles"][:4])
+        morceaux.append(f"Interprétation : le contenu porte principalement sur {themes}.")
 
-    if analyse["pied"] and analyse["pied"] != analyse["entete"]:
-        morceaux.append(phrase_liste("Éléments de pied de page ou de fin du document :", analyse["pied"][:2]))
+    ajouter_section_evidence(morceaux, "Éléments de fin de document :", analyse["evidences_pied"], limite=2)
 
+    manquants = informations_manquantes(analyse)
+    if manquants:
+        morceaux.append("Non trouvé explicitement dans le contenu extrait : " + joindre_liste(manquants) + ".")
+
+    morceaux.append("Aucune information non citée ci-dessus n'est ajoutée au résumé.")
     return limiter_texte(" ".join(morceaux), longueur_max)
 
 
 def generer_resume_texte(
     texte,
     nombre_phrases=3,
-    longueur_max=1000,
+    longueur_max=1400,
     fichier=None,
     utiliser_ia=False,
     utiliser_llm_detection=True,
 ):
     """
-    Génère un résumé réaliste en reformulant le contenu.
+    Génère un résumé vérifiable façon réponse sourcée.
 
-    Par défaut, la fonction produit une synthèse locale non extractive. Si
-    utiliser_ia=True et qu'un modèle transformers est disponible, elle tente
-    d'abord un résumé abstractive puis revient à la synthèse locale en fallback.
+    Le résumé final est construit uniquement à partir des éléments cités dans
+    le fichier. Le LLM peut aider à détecter le type de document, mais il
+    n'écrit pas librement les faits du résumé.
     """
     texte_original = texte
     texte_nettoye = nettoyer_texte(texte_original)
     if not texte_nettoye:
         return ""
 
-    if utiliser_ia:
-        resume_ia = generer_resume_ia(texte_nettoye, longueur_max=longueur_max)
-        if resume_ia:
-            return resume_ia
-
+    # Pour garantir un résultat exact, le LLM n'écrit pas le résumé final.
+    # Il peut seulement aider à la détection du type via utiliser_llm_detection.
     return generer_synthese_locale(
         texte_original,
         fichier=fichier,
