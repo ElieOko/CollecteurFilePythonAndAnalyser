@@ -31,6 +31,20 @@ MOTS_VIDES = {
     "cela",
     "dans",
     "des",
+    "rester",
+    "comprendre",
+    "peuvent",
+    "automatiquement",
+    "aide",
+    "resume",
+    "résumé",
+    "document",
+    "contenu",
+    "rapidement",
+    "permettre",
+    "permet",
+    "doit",
+    "cette",
     "elle",
     "elles",
     "entre",
@@ -456,6 +470,13 @@ def generer_resume_ia(texte, longueur_max=700):
     return limiter_texte(resume, longueur_max)
 
 
+def formater_objectif(objectif):
+    """Ajoute correctement de/d' devant un verbe à l'infinitif."""
+    if objectif[:1].lower() in {"a", "e", "i", "o", "u", "y", "h"}:
+        return f"d'{objectif}"
+    return f"de {objectif}"
+
+
 def generer_synthese_locale(texte, fichier=None, longueur_max=700):
     """Produit une synthèse reformulée sans recopier les phrases du fichier."""
     texte = nettoyer_texte(texte)
@@ -472,15 +493,15 @@ def generer_synthese_locale(texte, fichier=None, longueur_max=700):
         synthese = (
             f"Ce contenu court semble être {profil} centré sur {themes_principaux}. "
             f"Il fournit surtout une information rapide autour de {themes_secondaires}, "
-            f"avec pour objectif probable de {objectif}."
+            f"avec pour objectif probable {formater_objectif(objectif)}."
         )
     else:
         synthese = (
             f"Ce document semble être {profil} centré sur {themes_principaux}. "
             f"Il met en relation plusieurs éléments autour de {themes_secondaires}, "
-            f"ce qui indique que son objectif principal est de {objectif}. "
-            "La synthèse utile consiste donc à retenir le sujet dominant, les notions récurrentes "
-            "et la finalité pratique du document plutôt qu'une simple reprise de son texte."
+            f"ce qui indique que son objectif principal est {formater_objectif(objectif)}. "
+            f"En résumé, il sert surtout à donner une vue structurée des thèmes suivants : {themes_principaux}, "
+            "et à faciliter l'exploitation de ces informations."
         )
 
     return limiter_texte(synthese, longueur_max)
