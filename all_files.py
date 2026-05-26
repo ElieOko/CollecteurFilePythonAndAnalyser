@@ -2,6 +2,7 @@ from collections import Counter
 from contextlib import contextmanager
 import csv
 import logging
+import os
 import re
 import warnings
 import zipfile
@@ -66,6 +67,8 @@ MOTS_VIDES = {
 
 OCR_LANGUES = "fra+eng"
 AVERTISSEMENT_PDF_DICTIONNAIRE = "Multiple definitions in dictionary"
+RESUME_MODELE_DEFAUT = "csebuetnlp/mT5_multilingual_XLSum"
+_PIPELINE_RESUME = None
 
 
 def formater_taille(taille):
@@ -351,48 +354,169 @@ def decouper_en_phrases(texte):
     return [phrase.strip() for phrase in phrases if phrase.strip()]
 
 
-def generer_resume_texte(texte, nombre_phrases=3, longueur_max=700):
-    """
-    Génère un résumé extractif simple à partir du contenu.
+def extraire_mots_significatifs(texte, limite=10):
+    """Identifie les mots forts sans reprendre directement des phrases du document."""
+    mots = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9']+", texte.lower())
+    frequences = Counter(
+        mot
+        for mot in mots
+        if len(mot) > 3 and mot not in MOTS_VIDES and not mot.isdigit()
+    )
+    return [mot for mot, _ in frequences.most_common(limite)]
 
-    Les phrases les plus représentatives sont choisies avec un score basé sur la
-    fréquence des mots importants, puis replacées dans l'ordre du document.
+
+def joindre_liste(elements):
+    """Transforme une liste courte en expression française lisible."""
+    elements = [element for element in elements if element]
+    if not elements:
+        return "des informations générales"
+    if len(elements) == 1:
+        return elements[0]
+    return ", ".join(elements[:-1]) + " et " + elements[-1]
+
+
+def detecter_profil_document(texte, fichier=None):
+    """Déduit le type probable du document à partir de son vocabulaire."""
+    extension = fichier.suffix.lower() if fichier else ""
+    texte_min = texte.lower()
+
+    profils = [
+        (
+            "un document administratif ou contractuel",
+            "formaliser des informations, des engagements ou des éléments de suivi",
+            {"contrat", "signature", "article", "clause", "client", "adresse", "document"},
+        ),
+        (
+            "un document financier ou commercial",
+            "présenter des montants, des transactions ou des informations de facturation",
+            {"facture", "montant", "total", "tva", "prix", "paiement", "devis", "commande"},
+        ),
+        (
+            "un contenu technique",
+            "expliquer un fonctionnement, une procédure ou une logique de traitement",
+            {"python", "code", "fonction", "fichier", "dossier", "erreur", "système", "traitement"},
+        ),
+        (
+            "un support pédagogique ou documentaire",
+            "transmettre des connaissances ou structurer une explication",
+            {"chapitre", "cours", "exemple", "méthode", "apprendre", "question", "réponse", "notion"},
+        ),
+    ]
+
+    if extension in {".csv", ".xlsx", ".xls"} or " | " in texte:
+        return (
+            "un jeu de données ou tableau",
+            "organiser des informations sous forme de lignes, colonnes ou valeurs comparables",
+        )
+
+    meilleur_profil = ("un document général", "présenter les informations principales du contenu")
+    meilleur_score = 0
+    for libelle, objectif, mots_cles in profils:
+        score = sum(1 for mot in mots_cles if mot in texte_min)
+        if score > meilleur_score:
+            meilleur_score = score
+            meilleur_profil = (libelle, objectif)
+    return meilleur_profil
+
+
+def limiter_texte(texte, longueur_max):
+    """Coupe proprement une synthèse trop longue."""
+    texte = nettoyer_texte(texte)
+    if len(texte) <= longueur_max:
+        return texte
+    coupe = texte[:longueur_max].rsplit(" ", 1)[0]
+    return coupe.rstrip(" .,;") + "..."
+
+
+def generer_resume_ia(texte, longueur_max=700):
+    """Utilise un modèle de résumé si transformers est installé et configuré."""
+    global _PIPELINE_RESUME
+
+    try:
+        from transformers import pipeline
+    except ImportError:
+        return ""
+
+    modele = os.getenv("RESUME_MODELE", RESUME_MODELE_DEFAUT)
+    try:
+        if _PIPELINE_RESUME is None:
+            _PIPELINE_RESUME = pipeline("summarization", model=modele)
+        resultat = _PIPELINE_RESUME(
+            texte[:4500],
+            max_length=min(180, max(60, longueur_max // 4)),
+            min_length=25,
+            do_sample=False,
+        )
+    except Exception:
+        return ""
+
+    if not resultat:
+        return ""
+    resume = resultat[0].get("summary_text", "")
+    return limiter_texte(resume, longueur_max)
+
+
+def generer_synthese_locale(texte, fichier=None, longueur_max=700):
+    """Produit une synthèse reformulée sans recopier les phrases du fichier."""
+    texte = nettoyer_texte(texte)
+    mots_cles = extraire_mots_significatifs(texte)
+    if not mots_cles:
+        return "Le contenu contient trop peu de texte exploitable pour produire une synthèse fiable."
+
+    profil, objectif = detecter_profil_document(texte, fichier=fichier)
+    themes_principaux = joindre_liste(mots_cles[:3])
+    themes_secondaires = joindre_liste(mots_cles[3:7])
+    nombre_phrases = len(decouper_en_phrases(texte))
+
+    if len(texte) < 300 or nombre_phrases <= 2:
+        synthese = (
+            f"Ce contenu court semble être {profil} centré sur {themes_principaux}. "
+            f"Il fournit surtout une information rapide autour de {themes_secondaires}, "
+            f"avec pour objectif probable de {objectif}."
+        )
+    else:
+        synthese = (
+            f"Ce document semble être {profil} centré sur {themes_principaux}. "
+            f"Il met en relation plusieurs éléments autour de {themes_secondaires}, "
+            f"ce qui indique que son objectif principal est de {objectif}. "
+            "La synthèse utile consiste donc à retenir le sujet dominant, les notions récurrentes "
+            "et la finalité pratique du document plutôt qu'une simple reprise de son texte."
+        )
+
+    return limiter_texte(synthese, longueur_max)
+
+
+def generer_resume_texte(
+    texte,
+    nombre_phrases=3,
+    longueur_max=700,
+    fichier=None,
+    utiliser_ia=False,
+):
+    """
+    Génère un résumé réaliste en reformulant le contenu.
+
+    Par défaut, la fonction produit une synthèse locale non extractive. Si
+    utiliser_ia=True et qu'un modèle transformers est disponible, elle tente
+    d'abord un résumé abstractive puis revient à la synthèse locale en fallback.
     """
     texte = nettoyer_texte(texte)
     if not texte:
         return ""
-    if len(texte) <= longueur_max:
-        return texte
 
-    phrases = decouper_en_phrases(texte)
-    if not phrases:
-        return texte[:longueur_max].rstrip() + "..."
+    if utiliser_ia:
+        resume_ia = generer_resume_ia(texte, longueur_max=longueur_max)
+        if resume_ia:
+            return resume_ia
 
-    mots = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9']+", texte.lower())
-    frequences = Counter(mot for mot in mots if len(mot) > 3 and mot not in MOTS_VIDES)
-    if not frequences:
-        return texte[:longueur_max].rstrip() + "..."
-
-    scores = []
-    for index, phrase in enumerate(phrases):
-        mots_phrase = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9']+", phrase.lower())
-        score = sum(frequences[mot] for mot in mots_phrase if mot in frequences)
-        scores.append((score, index, phrase))
-
-    meilleures_phrases = sorted(scores, reverse=True)[:nombre_phrases]
-    phrases_ordonnees = [phrase for _, _, phrase in sorted(meilleures_phrases, key=lambda item: item[1])]
-    resume = nettoyer_texte(" ".join(phrases_ordonnees))
-
-    if len(resume) > longueur_max:
-        return resume[:longueur_max].rstrip() + "..."
-    return resume
+    return generer_synthese_locale(texte, fichier=fichier, longueur_max=longueur_max)
 
 
-def generer_resume_fichier(fichier):
-    """Génère le résumé d'un fichier collecté à partir de son contenu."""
+def generer_resume_fichier(fichier, utiliser_ia=False):
+    """Génère une synthèse réaliste d'un fichier collecté à partir de son contenu."""
     texte = extraire_texte_fichier(fichier)
     if texte:
-        return generer_resume_texte(texte)
+        return generer_resume_texte(texte, fichier=fichier, utiliser_ia=utiliser_ia)
 
     extension = fichier.suffix.lower()
     if extension in {".png", ".jpg", ".jpeg"}:
@@ -405,9 +529,15 @@ def generer_resume_fichier(fichier):
 
 
 
-def afficher_avec_statistiques(chemin, recursif=True, avec_resumes=True, max_resumes=None):
+def afficher_avec_statistiques(
+    chemin,
+    recursif=True,
+    avec_resumes=True,
+    max_resumes=None,
+    utiliser_ia=False,
+):
     """
-    Affiche les fichiers avec statistiques par extension et résumés de contenu.
+    Affiche les fichiers avec statistiques par extension et synthèses de contenu.
     """
     dossier = Path(chemin)
 
@@ -464,7 +594,7 @@ def afficher_avec_statistiques(chemin, recursif=True, avec_resumes=True, max_res
             print(f"📄 {rel_path} ({taille_str})")
 
     if avec_resumes and fichiers:
-        print("\n📝 RÉSUMÉS DES FICHIERS:\n")
+        print("\n📝 SYNTHÈSES DES FICHIERS:\n")
         fichiers_a_resumer = sorted(fichiers)
         if max_resumes is not None:
             fichiers_a_resumer = fichiers_a_resumer[:max_resumes]
@@ -476,7 +606,7 @@ def afficher_avec_statistiques(chemin, recursif=True, avec_resumes=True, max_res
                 rel_path = fichier.name
 
             print(f"📄 {rel_path}")
-            print(f"   {generer_resume_fichier(fichier)}\n")
+            print(f"   {generer_resume_fichier(fichier, utiliser_ia=utiliser_ia)}\n")
 
         if max_resumes is not None and len(fichiers) > max_resumes:
             print(f"... et {len(fichiers) - max_resumes} autre(s) fichier(s) non résumé(s)")
