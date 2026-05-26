@@ -1,0 +1,7 @@
+pypdf
+Pillow
+pytesseract
+pdf2image
+transformers
+torch
+sentencepiece
